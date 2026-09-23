@@ -1,0 +1,2 @@
+import type { ImageDisplayProps } from './SingleDisplay';
+export default function HologramDisplay({ src, onReady, onError }: ImageDisplayProps) { return <div className="hologram-layout">{['top', 'right', 'bottom', 'left'].map(side => <div className={`hologram-face face-${side}`} key={side}><div className="face-orientation"><div className="image-motion"><img src={src} alt="" draggable={false} onLoad={onReady} onError={onError} /></div></div></div>)}</div>; }

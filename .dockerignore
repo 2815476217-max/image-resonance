@@ -1,0 +1,9 @@
+node_modules
+.next
+.next-build
+.env*
+!.env.example
+!.env.production
+.git
+.pnpm-store
+*.tsbuildinfo

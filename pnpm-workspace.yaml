@@ -1,0 +1,5 @@
+packages:
+  - "."
+allowBuilds:
+  core-js-pure: true
+  protobufjs: true
