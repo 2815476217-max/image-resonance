@@ -1,19 +1,16 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
-import { deviceCutout, devicePlaylist, trimDeviceBitmap, type DeviceItem } from '@/lib/deviceSource';
+import { deviceCutout, fetchDeviceItems, trimDeviceBitmap, type DeviceItem } from '@/lib/deviceSource';
 import { subjectFit } from '@/lib/subjectLayout';
 
 const POLL_INTERVAL = 3000;
 const MOTION_DURATION = 5000;
-const EXIT_MS = 350, BLACK_MS = 250, ENTER_MS = 350;
-const TRANSITION_MS = EXIT_MS + BLACK_MS + ENTER_MS;
-type Prepared = { item: DeviceItem; image?: HTMLCanvasElement; video?: HTMLVideoElement; started: number; lastVideoTime?: number };
-type Transition = { old: Prepared | null; next: Prepared; started: number; videoStarted: boolean };
+type Prepared = { item: DeviceItem; image?: HTMLCanvasElement; video?: HTMLVideoElement; started: number };
 
 async function prepareVideo(src: string, signal: AbortSignal): Promise<HTMLVideoElement> {
   const video = document.createElement('video');
-  video.muted = true; video.playsInline = true; video.preload = 'auto'; video.loop = true;
+  video.muted = true; video.playsInline = true; video.preload = 'auto'; video.loop = false;
   video.src = src;
   try {
     await new Promise<void>((resolve, reject) => {
@@ -34,7 +31,7 @@ async function prepareVideo(src: string, signal: AbortSignal): Promise<HTMLVideo
 }
 function releaseVideo(person: Prepared | null) {
   if (!person?.video) return;
-  person.video.ontimeupdate = null; person.video.onended = null; person.video.pause(); person.video.removeAttribute('src'); person.video.load();
+  person.video.onended = null; person.video.pause(); person.video.removeAttribute('src'); person.video.load();
 }
 function newestFirst(a: DeviceItem, b: DeviceItem) {
   return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
@@ -46,8 +43,7 @@ export default function DeviceStage() {
   const debug = params.get('debug') === 'true';
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const current = useRef<Prepared | null>(null);
-  const transition = useRef<Transition | null>(null);
-  const [diagnostic, setDiagnostic] = useState({ currentId: '—', status: '启动中', sync: '—', latestId: '—', pendingId: '—', latestCreatedAt: '—' });
+  const [diagnostic, setDiagnostic] = useState({ currentId: '—', status: '启动中', sync: '—', latestId: '—', latestCreatedAt: '—' });
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -56,10 +52,10 @@ export default function DeviceStage() {
     if (!context) return;
     let stopped = false, frame = 0;
     let pollTimer: ReturnType<typeof setInterval>;
-    let lastDebugAt = 0, syncing = false, switching = false;
-    let pendingLatest: DeviceItem | null = null;
+    let syncing = false;
+    let switchVersion = 0;
+    let requestedId: string | null = null;
     const abort = new AbortController();
-    const invalidIds = new Set<string>();
 
     const resize = () => {
       const ratio = Math.min(window.devicePixelRatio || 1, 2);
@@ -95,24 +91,7 @@ export default function DeviceStage() {
     function render(now: number) {
       if (stopped || !canvas || !context) return;
       context.fillStyle = '#000000'; context.fillRect(0, 0, canvas.width, canvas.height);
-      const change = transition.current;
-      if (change) {
-        const elapsed = now - change.started;
-        if (elapsed >= EXIT_MS + BLACK_MS && !change.videoStarted) {
-          change.videoStarted = true;
-          if (change.next.video) void change.next.video.play().catch(error => console.warn('[DEVICE] video playback failed', error));
-        }
-        if (elapsed < EXIT_MS) { if (change.old) draw(change.old, 1 - elapsed / EXIT_MS, now); }
-        else if (elapsed >= EXIT_MS + BLACK_MS && elapsed < TRANSITION_MS) draw(change.next, (elapsed - EXIT_MS - BLACK_MS) / ENTER_MS, now);
-        else if (elapsed >= TRANSITION_MS) {
-          releaseVideo(change.old); current.current = change.next; transition.current = null; draw(change.next, 1, now);
-          setDiagnostic(prev => ({ ...prev, status: '播放最新影像', currentId: change.next.item.id, pendingId: pendingLatest?.id || '—' }));
-        }
-      } else if (current.current) draw(current.current, 1, now);
-      if (debug && now - lastDebugAt >= 250) {
-        lastDebugAt = now;
-        setDiagnostic(prev => ({ ...prev, pendingId: pendingLatest?.id || '—' }));
-      }
+      if (current.current) draw(current.current, 1, now);
       frame = requestAnimationFrame(render);
     }
     frame = requestAnimationFrame(render);
@@ -127,39 +106,41 @@ export default function DeviceStage() {
       }
       throw new Error('No playable video');
     }
-    async function switchTo(item: DeviceItem): Promise<boolean> {
-      if (switching || stopped || transition.current) return false;
-      switching = true;
+    async function switchImmediately(item: DeviceItem): Promise<boolean> {
+      const version = ++switchVersion;
+      requestedId = item.id;
       try {
         setDiagnostic(prev => ({ ...prev, status: '正在准备最新影像' }));
         const next = await prepare(item);
-        if (stopped) { releaseVideo(next); return false; }
+        if (stopped || version !== switchVersion) { releaseVideo(next); return false; }
         if (next.video) {
-          next.lastVideoTime = 0;
-          next.video.ontimeupdate = () => {
-            const previous = next.lastVideoTime || 0;
-            const now = next.video?.currentTime || 0;
-            next.lastVideoTime = now;
-            if (previous > .5 && now + .5 < previous) void onLoopBoundary(next);
+          next.video.onended = () => {
+            const video = next.video;
+            if (!video || current.current !== next) return;
+            video.pause();
+            if (Number.isFinite(video.duration) && video.duration > 0.05) {
+              video.currentTime = Math.max(0, video.duration - 0.04);
+            }
+            setDiagnostic(prev => ({ ...prev, status: '停留在最新影像' }));
           };
         }
-        transition.current = { old: current.current, next, started: performance.now(), videoStarted: false };
-        setDiagnostic(prev => ({ ...prev, status: '切换中' }));
+        const old = current.current;
+        current.current = next;
+        requestedId = null;
+        releaseVideo(old);
+        if (next.video) {
+          next.video.currentTime = 0;
+          await next.video.play().catch(error => console.warn('[DEVICE] video playback failed', error));
+        }
+        setDiagnostic(prev => ({ ...prev, status: '播放最新影像', currentId: item.id }));
         return true;
       } catch (error) {
+        if (version === switchVersion) requestedId = null;
         if (!stopped) {
-          console.warn('[DEVICE] skipping invalid item:', item.id, error); invalidIds.add(item.id);
+          console.warn('[DEVICE] latest item cannot play:', item.id, error);
           setDiagnostic(prev => ({ ...prev, status: '最新影像无法播放' }));
         }
         return false;
-      } finally { switching = false; }
-    }
-    async function onLoopBoundary(person: Prepared) {
-      if (stopped || transition.current || current.current !== person) return;
-      const pending = pendingLatest;
-      if (pending && pending.id !== person.item.id) {
-        pendingLatest = null;
-        await switchTo(pending);
       }
     }
 
@@ -168,15 +149,15 @@ export default function DeviceStage() {
       syncing = true;
       try {
         if (process.env.NODE_ENV === 'development') console.info('[DEVICE] latest sync start');
-        const items = await devicePlaylist(demo, abort.signal);
+        const items = await fetchDeviceItems(demo, abort.signal);
         if (stopped) return;
-        const latestItem = items.filter(item => !invalidIds.has(item.id) && Boolean(item.videoUrl || item.demo)).sort(newestFirst)[0] || null;
-        const activeId = transition.current?.next.item.id || current.current?.item.id || null;
-        if (latestItem && activeId && latestItem.id !== activeId) pendingLatest = latestItem;
-        else if (!latestItem || latestItem.id === activeId) pendingLatest = null;
+        const latestItem = items.filter(item => Boolean(item.videoUrl || item.demo)).sort(newestFirst)[0] || null;
+        const activeId = current.current?.item.id || null;
         if (process.env.NODE_ENV === 'development') console.info('[DEVICE] latest item:', latestItem?.id || 'none');
-        setDiagnostic(prev => ({ ...prev, latestId: latestItem?.id || '—', latestCreatedAt: latestItem?.createdAt || '—', pendingId: pendingLatest?.id || '—', sync: new Date().toLocaleTimeString('zh-CN'), status: latestItem ? prev.status : '暂无 ready 视频' }));
-        if (latestItem && !current.current && !transition.current && !switching) await switchTo(latestItem);
+        setDiagnostic(prev => ({ ...prev, latestId: latestItem?.id || '—', latestCreatedAt: latestItem?.createdAt || '—', sync: new Date().toLocaleTimeString('zh-CN'), status: latestItem ? prev.status : '暂无 ready 视频' }));
+        if (latestItem && latestItem.id !== activeId && latestItem.id !== requestedId) {
+          void switchImmediately(latestItem);
+        }
       } catch (error) {
         if (!stopped) { console.error('[DEVICE] sync failed', error); setDiagnostic(prev => ({ ...prev, status: error instanceof Error ? error.message : '读取失败', sync: new Date().toLocaleTimeString('zh-CN') })); }
       } finally { syncing = false; }
@@ -185,13 +166,13 @@ export default function DeviceStage() {
     void sync(); pollTimer = setInterval(() => void sync(), POLL_INTERVAL);
     return () => {
       stopped = true; abort.abort(); clearInterval(pollTimer); cancelAnimationFrame(frame);
-      releaseVideo(current.current); releaseVideo(transition.current?.next || null);
+      switchVersion += 1; releaseVideo(current.current);
       window.removeEventListener('resize', resize); document.body.classList.remove('display-body');
     };
   }, [demo, debug]);
 
   return <main className="device-stage" aria-label="全息设备播放画面">
     <canvas ref={canvasRef} aria-hidden="true" />
-    {debug && <output className="device-debug">{`latest cloud id: ${diagnostic.latestId}\ncurrent playing id: ${diagnostic.currentId}\npending latest id: ${diagnostic.pendingId}\nlast poll time: ${diagnostic.sync}\nlatest createdAt: ${diagnostic.latestCreatedAt}`}</output>}
+    {debug && <output className="device-debug">{`latest cloud id: ${diagnostic.latestId}\ncurrent playing id: ${diagnostic.currentId}\nlast poll time: ${diagnostic.sync}\nlatest createdAt: ${diagnostic.latestCreatedAt}\nstate: ${diagnostic.status}`}</output>}
   </main>;
 }

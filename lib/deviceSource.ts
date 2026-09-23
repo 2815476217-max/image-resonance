@@ -3,7 +3,7 @@ import { fetchExhibitionItems } from './cloudbase';
 export type DeviceItem = { id: string; createdAt: string; imageUrl: string; cutoutUrl?: string | null; videoUrl?: string | null; demo?: boolean };
 
 /** 正式模式只读取与 gallery 相同的站内 API，并只保留可播放的 ready 视频。 */
-export async function devicePlaylist(demo: boolean, signal: AbortSignal): Promise<DeviceItem[]> {
+export async function fetchDeviceItems(demo: boolean, signal: AbortSignal): Promise<DeviceItem[]> {
   if (demo) return [{ id: 'demo-person-1', createdAt: '', imageUrl: '/demo/person-1.png', cutoutUrl: '/demo/person-1.png', demo: true }];
   const records = await fetchExhibitionItems(signal);
   return records.filter(item => item.status === 'ready' && Boolean(item.videoUrl)).map(item => {
